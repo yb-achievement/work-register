@@ -1,0 +1,17 @@
+.DS_Store
+.idea/
+.vscode/
+
+work-register-frontend/node_modules/
+work-register-frontend/dist/
+work-register-frontend/.env.local
+work-register-frontend/.env.*.local
+
+work-register-backend/target/
+work-register-backend/logs/
+work-register-backend/src/main/resources/application-prod.yml
+
+*.log
+*.tar.gz
+*.pem
+*.key

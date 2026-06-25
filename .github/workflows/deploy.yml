@@ -1,0 +1,168 @@
+name: Build and Deploy
+
+on:
+  push:
+    branches:
+      - main
+  workflow_dispatch:
+
+concurrency:
+  group: production-deploy
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+env:
+  APP_NAME: work-register
+  BACKEND_SERVICE: my-project.service
+  BACKEND_DIR: /opt/work-register
+  FRONTEND_DIR: /var/www/work-register
+
+jobs:
+  build-and-deploy:
+    name: Build and deploy to ECS
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+
+    steps:
+      - name: Checkout source
+        uses: actions/checkout@v4
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: npm
+          cache-dependency-path: work-register-frontend/package-lock.json
+
+      - name: Install frontend dependencies
+        working-directory: work-register-frontend
+        run: npm install
+
+      - name: Build frontend
+        working-directory: work-register-frontend
+        run: npm run build
+
+      - name: Set up Java
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "17"
+          cache: maven
+          cache-dependency-path: work-register-backend/pom.xml
+
+      - name: Build backend
+        working-directory: work-register-backend
+        run: mvn --batch-mode clean package
+
+      - name: Prepare deployment package
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p deployment/frontend deployment/backend
+          cp -a work-register-frontend/dist/. deployment/frontend/
+          cp work-register-backend/target/work-register-backend-*.jar deployment/backend/app.jar
+          tar -C deployment -czf "${APP_NAME}-${GITHUB_SHA}.tar.gz" .
+
+      - name: Configure SSH
+        shell: bash
+        env:
+          ECS_SSH_PRIVATE_KEY: ${{ secrets.ECS_SSH_PRIVATE_KEY }}
+          ECS_KNOWN_HOSTS: ${{ secrets.ECS_KNOWN_HOSTS }}
+        run: |
+          set -euo pipefail
+          install -m 700 -d ~/.ssh
+          printf '%s\n' "${ECS_SSH_PRIVATE_KEY}" > ~/.ssh/deploy_key
+          chmod 600 ~/.ssh/deploy_key
+          printf '%s\n' "${ECS_KNOWN_HOSTS}" > ~/.ssh/known_hosts
+          chmod 600 ~/.ssh/known_hosts
+
+      - name: Upload deployment package
+        shell: bash
+        env:
+          ECS_HOST: ${{ secrets.ECS_HOST }}
+          ECS_USER: ${{ secrets.ECS_USER }}
+          ECS_SSH_PORT: ${{ secrets.ECS_SSH_PORT }}
+        run: |
+          set -euo pipefail
+          SSH_PORT="${ECS_SSH_PORT:-22}"
+          scp -P "${SSH_PORT}" -i ~/.ssh/deploy_key \
+            "${APP_NAME}-${GITHUB_SHA}.tar.gz" \
+            "${ECS_USER}@${ECS_HOST}:/tmp/${APP_NAME}-${GITHUB_SHA}.tar.gz"
+
+      - name: Deploy on ECS
+        shell: bash
+        env:
+          ECS_HOST: ${{ secrets.ECS_HOST }}
+          ECS_USER: ${{ secrets.ECS_USER }}
+          ECS_SSH_PORT: ${{ secrets.ECS_SSH_PORT }}
+        run: |
+          set -euo pipefail
+          SSH_PORT="${ECS_SSH_PORT:-22}"
+          ssh -p "${SSH_PORT}" -i ~/.ssh/deploy_key \
+            "${ECS_USER}@${ECS_HOST}" \
+            "APP_NAME='${APP_NAME}' RELEASE_SHA='${GITHUB_SHA}' BACKEND_DIR='${BACKEND_DIR}' FRONTEND_DIR='${FRONTEND_DIR}' BACKEND_SERVICE='${BACKEND_SERVICE}' bash -s" <<'REMOTE_SCRIPT'
+          set -euo pipefail
+
+          PACKAGE="/tmp/${APP_NAME}-${RELEASE_SHA}.tar.gz"
+          STAGING="/tmp/${APP_NAME}-${RELEASE_SHA}"
+          FRONTEND_NEW="${FRONTEND_DIR}.new"
+          FRONTEND_OLD="${FRONTEND_DIR}.old"
+
+          trap 'rm -rf "${STAGING}" "${PACKAGE}"' EXIT
+
+          rm -rf "${STAGING}"
+          mkdir -p "${STAGING}"
+          tar -xzf "${PACKAGE}" -C "${STAGING}"
+
+          sudo install -d -o workregister -g workregister "${BACKEND_DIR}"
+          sudo install -o workregister -g workregister -m 0644 \
+            "${STAGING}/backend/app.jar" "${BACKEND_DIR}/app.jar"
+
+          sudo rm -rf "${FRONTEND_NEW}"
+          sudo install -d -o www-data -g www-data "${FRONTEND_NEW}"
+          sudo cp -a "${STAGING}/frontend/." "${FRONTEND_NEW}/"
+          sudo chown -R www-data:www-data "${FRONTEND_NEW}"
+
+          sudo rm -rf "${FRONTEND_OLD}"
+          if sudo test -d "${FRONTEND_DIR}"; then
+            sudo mv "${FRONTEND_DIR}" "${FRONTEND_OLD}"
+          fi
+          sudo mv "${FRONTEND_NEW}" "${FRONTEND_DIR}"
+
+          sudo systemctl restart "${BACKEND_SERVICE}"
+          sudo nginx -t
+          sudo systemctl reload nginx
+
+          for attempt in {1..12}; do
+            if curl -fsS http://127.0.0.1:8080/api/work-items | grep -q '"code":0'; then
+              break
+            fi
+            if [ "${attempt}" -eq 12 ]; then
+              sudo systemctl status "${BACKEND_SERVICE}" --no-pager
+              exit 1
+            fi
+            sleep 5
+          done
+
+          curl -fsS http://127.0.0.1/ > /dev/null
+          sudo rm -rf "${FRONTEND_OLD}"
+          REMOTE_SCRIPT
+
+      - name: Verify public endpoints
+        shell: bash
+        env:
+          ECS_HOST: ${{ secrets.ECS_HOST }}
+          APP_BASE_URL: ${{ secrets.APP_BASE_URL }}
+        run: |
+          set -euo pipefail
+          BASE_URL="${APP_BASE_URL:-http://${ECS_HOST}}"
+          BASE_URL="${BASE_URL%/}"
+
+          curl -fsS --retry 5 --retry-delay 3 --retry-all-errors \
+            "${BASE_URL}/" > /dev/null
+          curl -fsS --retry 5 --retry-delay 3 --retry-all-errors \
+            "${BASE_URL}/api/work-items" | grep -q '"code":0'
+
+          echo "Deployment verification passed: ${BASE_URL}"
